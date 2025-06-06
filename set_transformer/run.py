@@ -1,151 +1,102 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import pandas as pd
 import numpy as np
-import pickle
 import os
 import argparse
 import logging
 import time
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from models import SetTransformer, DeepSet
-from mixture_of_mvns import MixtureOfMVNs
-from mvn_diag import MultivariateNormalDiag
+from models import SetTransformer
+from sklearn.decomposition import PCA
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', type=str, default='train')
-parser.add_argument('--num_bench', type=int, default=100)
-parser.add_argument('--net', type=str, default='set_transformer')
-parser.add_argument('--B', type=int, default=10)
-parser.add_argument('--N_min', type=int, default=300)
-parser.add_argument('--N_max', type=int, default=600)
-parser.add_argument('--K', type=int, default=4)
 parser.add_argument('--gpu', type=str, default='0')
 parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--run_name', type=str, default='trial')
-parser.add_argument('--num_steps', type=int, default=50000)
+parser.add_argument('--run_name', type=str, default='TAPES_experiment')
+parser.add_argument('--num_steps', type=int, default=10000)
 parser.add_argument('--test_freq', type=int, default=200)
 parser.add_argument('--save_freq', type=int, default=400)
-
 args = parser.parse_args()
+
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-B = args.B
-N_min = args.N_min
-N_max = args.N_max
-K = args.K
+# GPU device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-D = 2
-mvn = MultivariateNormalDiag(D)
-mog = MixtureOfMVNs(mvn)
-dim_output = 2*D
+# 模型初始化 (D为特征数)
+data_path = 'data/raw/TAPES_Data_Harvard_random50.csv'
+data_df = pd.read_csv(data_path)
 
-if args.net == 'set_transformer':
-    net = SetTransformer(D, K, dim_output).cuda()
-elif args.net == 'deepset':
-    net = DeepSet(D, K, dim_output).cuda()
-else:
-    raise ValueError('Invalid net {}'.format(args.net))
-benchfile = os.path.join('benchmark', 'mog_{:d}.pkl'.format(K))
+# 选择仅数值型列（自动筛选）
+numeric_data_df = data_df.select_dtypes(include=[np.number])
 
-def generate_benchmark():
-    if not os.path.isdir('benchmark'):
-        os.makedirs('benchmark')
-    N_list = np.random.randint(N_min, N_max, args.num_bench)
-    data = []
-    ll = 0.
-    for N in tqdm(N_list):
-        X, labels, pi, params = mog.sample(B, N, K, return_gt=True)
-        ll += mog.log_prob(X, pi, params).item()
-        data.append(X)
-    bench = [data, ll/args.num_bench]
-    torch.save(bench, benchfile)
+# 检查筛选后的列
+print(f"Numeric columns used: {numeric_data_df.columns.tolist()}")
 
-save_dir = os.path.join('results', args.net, args.run_name)
+# 转换数据为float32
+X_np = numeric_data_df.values.astype(np.float32)
+
+# PCA降维到512维
+# pca = PCA(n_components=512)
+# PCA降维到最大允许值 (50)
+pca = PCA(n_components=50)
+X_np_reduced = pca.fit_transform(X_np)
+
+# 转换数据为Tensor
+# 关键改动，加上unsqueeze(0)适应模型
+X_tensor = torch.from_numpy(X_np_reduced).unsqueeze(0).to(device)
+# 根据数据维度自动定义模型维度
+# 明确维度
+batch_size, set_size, feature_dim = X_tensor.shape
+print(f"Batch size: {batch_size}, Set size: {set_size}, Feature dim: {feature_dim}")
+
+D = feature_dim  # 明确为feature_dim
+K = 5  # Attention heads数目，可以根据需要修改
+dim_output = D  # 可以根据你的实验调整
+
+net = SetTransformer(D, K, dim_output).to(device)
+
+# 模型保存路径
+save_dir = os.path.join('experiments', 'set_transformer', args.run_name)
+if not os.path.isdir(save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+
+# 定义训练函数
 def train():
-    if not os.path.isdir(save_dir):
-        os.makedirs(save_dir)
-
-    if not os.path.isfile(benchfile):
-        generate_benchmark()
-
-    bench = torch.load(benchfile)
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(args.run_name)
     logger.addHandler(logging.FileHandler(
-        os.path.join(save_dir,
-            'train_'+time.strftime('%Y%m%d-%H%M')+'.log'),
+        os.path.join(save_dir, 'train_' + time.strftime('%Y%m%d-%H%M') + '.log'),
         mode='w'))
     logger.info(str(args) + '\n')
 
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
-    tick = time.time()
-    for t in range(1, args.num_steps+1):
-        if t == int(0.5*args.num_steps):
-            optimizer.param_groups[0]['lr'] *= 0.1
+    criterion = torch.nn.MSELoss()
+
+    for t in tqdm(range(1, args.num_steps + 1)):
         net.train()
         optimizer.zero_grad()
-        N = np.random.randint(N_min, N_max)
-        X = mog.sample(B, N, K)
-        ll = mog.log_prob(X, *mvn.parse(net(X)))
-        loss = -ll
+
+        # 训练：简单示例 (自监督示例，可调整)
+        pred = net(X_tensor)
+        loss = criterion(pred, X_tensor)  # 此处为示例，具体损失函数需根据实际任务调整
         loss.backward()
         optimizer.step()
 
         if t % args.test_freq == 0:
-            line = 'step {}, lr {:.3e}, '.format(
-                    t, optimizer.param_groups[0]['lr'])
-            line += test(bench, verbose=False)
-            line += ' ({:.3f} secs)'.format(time.time()-tick)
-            tick = time.time()
-            logger.info(line)
+            logger.info(f'Step {t}, Loss {loss.item()}')
 
         if t % args.save_freq == 0:
-            torch.save({'state_dict':net.state_dict()},
-                    os.path.join(save_dir, 'model.tar'))
+            torch.save({'state_dict': net.state_dict()},
+                       os.path.join(save_dir, 'model.tar'))
 
-    torch.save({'state_dict':net.state_dict()},
-        os.path.join(save_dir, 'model.tar'))
-
-def test(bench, verbose=True):
-    net.eval()
-    data, oracle_ll = bench
-    avg_ll = 0.
-    for X in data:
-        X = X.cuda()
-        avg_ll += mog.log_prob(X, *mvn.parse(net(X))).item()
-    avg_ll /= len(data)
-    line = 'test ll {:.4f} (oracle {:.4f})'.format(avg_ll, oracle_ll)
-    if verbose:
-        logging.basicConfig(level=logging.INFO)
-        logger = logging.getLogger(args.run_name)
-        logger.addHandler(logging.FileHandler(
-            os.path.join(save_dir, 'test.log'), mode='w'))
-        logger.info(line)
-    return line
-
-def plot():
-    net.eval()
-    X = mog.sample(B, np.random.randint(N_min, N_max), K)
-    pi, params = mvn.parse(net(X))
-    ll, labels = mog.log_prob(X, pi, params, return_labels=True)
-    fig, axes = plt.subplots(2, B//2, figsize=(7*B//5,5))
-    mog.plot(X, labels, params, axes)
-    plt.show()
+    torch.save({'state_dict': net.state_dict()},
+               os.path.join(save_dir, 'model.tar'))
 
 if __name__ == '__main__':
-    if args.mode == 'bench':
-        generate_benchmark()
-    elif args.mode == 'train':
+    if args.mode == 'train':
         train()
-    elif args.mode == 'test':
-        bench = torch.load(benchfile)
-        ckpt = torch.load(os.path.join(save_dir, 'model.tar'))
-        net.load_state_dict(ckpt['state_dict'])
-        test(bench)
-    elif args.mode == 'plot':
-        ckpt = torch.load(os.path.join(save_dir, 'model.tar'))
-        net.load_state_dict(ckpt['state_dict'])
-        plot()
+
