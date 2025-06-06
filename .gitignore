@@ -192,3 +192,24 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+# TRACE Model(ICDM 2025)
+# 2025-06-06
+# Ignore directories and files related to the TRACE model
+## Directories
+__pycache__/
+.vscode/
+wandb/
+experiments/
+
+
+## Files
+*.log
+*.json
+*.csv
+*.pyc
+.env
+*.sif
+.ipynb_checkpoints
+.DS_Store
